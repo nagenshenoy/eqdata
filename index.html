@@ -391,6 +391,11 @@ body {
   cursor: pointer; font-weight: 600;
 }
 .wl-chip-name:hover { text-decoration: underline; }
+.wl-chip-age {
+  font-size: .62rem; color: var(--green); opacity: .8;
+  font-family: 'JetBrains Mono', monospace;
+}
+.wl-chip-age-miss { color: var(--dim); }
 .wl-chip-remove {
   background: none; border: none; color: var(--dim); cursor: pointer;
   font-size: .8rem; line-height: 1; padding: 0; margin-left: 2px;
@@ -1994,41 +1999,58 @@ async function loadData() {
   document.getElementById('main-content').style.display = 'none';
 
   try {
-    const rawHtml = await fetchViaPublicProxy(targetUrl);
-    const parser  = new DOMParser();
-    const doc     = parser.parseFromString(rawHtml, 'text/html');
+    // ── Cache check ──────────────────────────────────────────────────────────
+    const cacheKey  = `ca_cache_v1_${ticker}_${CURRENT_MODE}`;
+    const cached    = wlCacheGet(cacheKey);
+    let companyName, stats, tables, fromCache = false;
 
-    const companyName = parseCompanyName(doc);
-    const stats       = parseStats(doc);
-    const rawTables   = parseTables(doc);
+    if (cached) {
+      // Serve from cache instantly
+      companyName = cached.companyName;
+      stats       = cached.stats;
+      tables      = cached.tables;
+      fromCache   = true;
+      const ageStr = wlCacheAge(cached.cachedAt);
+      setStatus(`⚡ From cache · ${ageStr}`, 'ok');
+    } else {
+      // Live fetch
+      const rawHtml   = await fetchViaPublicProxy(targetUrl);
+      const parser    = new DOMParser();
+      const doc       = parser.parseFromString(rawHtml, 'text/html');
+      companyName     = parseCompanyName(doc);
+      stats           = parseStats(doc);
+      const rawTables = parseTables(doc);
 
-    const KEEP = new Set(['quarterly results','profit & loss','balance sheet','cash flows','ratios','shareholding pattern']);
-    const seen = new Set();
-    const tables = rawTables.filter(t => {
-      const key = t.title.toLowerCase().trim();
-      // flexible matching — contains check for all categories
-      const matched =
-        key.includes('quarterly') ||
-        (key.includes('profit') && key.includes('loss')) ||
-        key.includes('balance sheet') ||
-        key.includes('cash flow') ||
-        key === 'ratios' || key.startsWith('ratio') ||
-        key.includes('shareholding');
-      if (!matched) return false;
-      // deduplicate by canonical key
-      const canon = key.includes('quarterly') ? 'quarterly'
-        : key.includes('profit') ? 'pl'
-        : key.includes('balance') ? 'bs'
-        : key.includes('cash') ? 'cf'
-        : key.includes('ratio') ? 'rat'
-        : 'sh';
-      if (seen.has(canon)) return false;
-      seen.add(canon); return true;
-    });
+      const seen = new Set();
+      tables = rawTables.filter(t => {
+        const key = t.title.toLowerCase().trim();
+        const matched =
+          key.includes('quarterly') ||
+          (key.includes('profit') && key.includes('loss')) ||
+          key.includes('balance sheet') ||
+          key.includes('cash flow') ||
+          key === 'ratios' || key.startsWith('ratio') ||
+          key.includes('shareholding');
+        if (!matched) return false;
+        const canon = key.includes('quarterly') ? 'quarterly'
+          : key.includes('profit') ? 'pl'
+          : key.includes('balance') ? 'bs'
+          : key.includes('cash') ? 'cf'
+          : key.includes('ratio') ? 'rat'
+          : 'sh';
+        if (seen.has(canon)) return false;
+        seen.add(canon); return true;
+      });
 
-    if (!tables.length) throw new Error('No financial tables found. Check the ticker symbol.');
+      if (!tables.length) throw new Error('No financial tables found. Check the ticker symbol.');
 
-    // Map tables
+      // ── Write to cache only if ticker is in watchlist ──────────────────────
+      if (wlGetAll().includes(ticker)) {
+        wlCacheSet(cacheKey, { companyName, stats, tables, cachedAt: Date.now(), mode: CURRENT_MODE });
+      }
+    }
+
+    // ── Map tables ────────────────────────────────────────────────────────────
     DATA.quarterly = tables.find(t => t.title.toLowerCase().includes('quarterly')) || null;
     DATA.pl        = tables.find(t => t.title.toLowerCase().includes('profit') && t.title.toLowerCase().includes('loss')) || null;
     DATA.bs        = tables.find(t => t.title.toLowerCase().includes('balance')) || null;
@@ -2060,7 +2082,9 @@ async function loadData() {
     document.getElementById('main-content').style.display = 'block';
     switchTab(0);
 
-    setStatus(`✓ Loaded ${tables.length} sections`, 'ok');
+    setStatus(fromCache
+      ? `⚡ From cache · ${wlCacheAge(wlCacheGet('ca_cache_v1_'+ticker+'_'+CURRENT_MODE)?.cachedAt)}`
+      : `✓ Live · ${tables.length} sections`, 'ok');
     wlRender(); // refresh watchlist Add button state
 
   } catch(e) {
@@ -3857,8 +3881,89 @@ function pfSave() {
 pfLoad(); // load on startup
 
 // ═══════════════════════════════════════════════════════════════════════════
-// WATCHLIST ENGINE
+// WATCHLIST CACHE ENGINE
+// Max 20 entries (one per watchlisted ticker+mode pair).
 // ═══════════════════════════════════════════════════════════════════════════
+const WL_CACHE_PREFIX = 'ca_cache_v1_';
+const WL_CACHE_INDEX  = 'ca_cache_index_v1'; // tracks [{key, ticker, cachedAt}]
+const WL_CACHE_MAX    = 20;
+
+function wlCacheIndexGet() {
+  try { return JSON.parse(localStorage.getItem(WL_CACHE_INDEX) || '[]'); } catch(e) { return []; }
+}
+function wlCacheIndexSave(idx) {
+  try { localStorage.setItem(WL_CACHE_INDEX, JSON.stringify(idx)); } catch(e) {}
+}
+
+function wlCacheGet(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch(e) { return null; }
+}
+
+function wlCacheSet(key, payload) {
+  try {
+    let idx = wlCacheIndexGet();
+    // Remove existing entry for this key
+    idx = idx.filter(e => e.key !== key);
+    // Enforce max — evict oldest first
+    while (idx.length >= WL_CACHE_MAX) {
+      const oldest = idx.shift();
+      try { localStorage.removeItem(oldest.key); } catch(e) {}
+    }
+    // Write data
+    localStorage.setItem(key, JSON.stringify(payload));
+    // Update index
+    idx.push({ key, ticker: payload.companyName || key, cachedAt: payload.cachedAt });
+    wlCacheIndexSave(idx);
+  } catch(e) {
+    console.warn('Cache write failed (storage full?):', e);
+  }
+}
+
+// Remove all cache entries for a given ticker symbol
+function wlCachePurge(ticker) {
+  const modes = ['consolidated','standalone'];
+  modes.forEach(m => {
+    const key = `${WL_CACHE_PREFIX}${ticker}_${m}`;
+    try { localStorage.removeItem(key); } catch(e) {}
+  });
+  // Clean index
+  const idx = wlCacheIndexGet().filter(e => !e.key.includes(`_${ticker}_`));
+  wlCacheIndexSave(idx);
+}
+
+// Human-readable age string: "just now", "5m ago", "2h ago", "3d ago"
+function wlCacheAge(ts) {
+  if (!ts) return 'unknown age';
+  const diff = Date.now() - ts;
+  const m = Math.floor(diff / 60000);
+  if (m < 1)   return 'just now';
+  if (m < 60)  return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24)  return `${h}h ago`;
+  return `${Math.floor(h/24)}d ago`;
+}
+
+// ── Also write to cache when user adds current ticker to watchlist ───────────
+function wlCacheCurrentIfNeeded() {
+  // Only cache if we have live data (tables loaded)
+  if (!CURRENT_TICKER || !DATA.quarterly) return;
+  const key = `${WL_CACHE_PREFIX}${CURRENT_TICKER}_${CURRENT_MODE}`;
+  if (wlCacheGet(key)) return; // already cached
+  const stats = [];
+  document.querySelectorAll('#kpi-strip .kpi-card').forEach(card => {
+    const label = card.querySelector('.kpi-label')?.textContent?.trim() || '';
+    const value = card.querySelector('.kpi-value')?.textContent?.trim() || '';
+    if (label && value) stats.push({ label, value });
+  });
+  const tables = [DATA.quarterly, DATA.pl, DATA.bs, DATA.cf, DATA.rat, DATA.sh].filter(Boolean);
+  const companyName = document.getElementById('hdr-company')?.textContent || CURRENT_TICKER;
+  wlCacheSet(key, { companyName, stats, tables, cachedAt: Date.now(), mode: CURRENT_MODE });
+}
+
+// ─── WATCHLIST ENGINE ────────────────────────────────────────────────────────
 const WL_KEY = 'ca_watchlist_v1';
 
 function wlGetAll() {
@@ -3874,13 +3979,15 @@ function wlAdd() {
   if (!ticker) return;
   const list = wlGetAll();
   if (!list.includes(ticker)) { list.push(ticker); wlSave(list); }
+  wlCacheCurrentIfNeeded(); // write cache now that it's in the watchlist
   wlRender();
 }
 
-// Remove a ticker from watchlist
+// Remove a ticker from watchlist (also purge its cache)
 function wlRemove(ticker) {
   const list = wlGetAll().filter(t => t !== ticker);
   wlSave(list);
+  wlCachePurge(ticker); // evict cached data
   wlRender();
 }
 
@@ -3890,18 +3997,17 @@ function wlLoad(ticker) {
   loadData();
 }
 
-// Render chips
+// Render chips with cache-age indicator
 function wlRender() {
   const list     = wlGetAll();
   const chipsEl  = document.getElementById('wl-chips');
-  const hintEl   = document.getElementById('wl-empty-hint');
   const addBtn   = document.getElementById('wl-btn-add');
 
-  // Show/hide ＋ Add button based on whether current ticker is already in list
+  // Show/hide ＋ Add button
   const alreadyIn = CURRENT_TICKER && list.includes(CURRENT_TICKER);
   if (addBtn) {
-    addBtn.style.display = CURRENT_TICKER ? 'inline-flex' : 'none';
-    addBtn.textContent   = alreadyIn ? '✓ Saved' : '＋ Add';
+    addBtn.style.display    = CURRENT_TICKER ? 'inline-flex' : 'none';
+    addBtn.textContent      = alreadyIn ? '✓ Saved' : '＋ Add';
     addBtn.style.background = alreadyIn ? 'rgba(0,230,118,.06)' : '';
     addBtn.style.color      = alreadyIn ? 'var(--dim)' : '';
     addBtn.onclick          = alreadyIn ? null : wlAdd;
@@ -3909,15 +4015,24 @@ function wlRender() {
   }
 
   if (!list.length) {
-    chipsEl.innerHTML = '<span class="wl-empty-hint" id="wl-empty-hint">No tickers saved — load a company and click ＋ to add</span>';
+    chipsEl.innerHTML = '<span class="wl-empty-hint">No tickers saved — load a company and click ＋ to add</span>';
     return;
   }
 
-  chipsEl.innerHTML = list.map(t => `
-    <span class="wl-chip" title="Click ticker to load">
-      <span class="wl-chip-name" onclick="wlLoad('${esc(t)}')">${esc(t)}</span>
-      <button class="wl-chip-remove" onclick="wlRemove('${esc(t)}')" title="Remove from watchlist">✕</button>
-    </span>`).join('');
+  chipsEl.innerHTML = list.map(t => {
+    // Find cache age for this ticker (prefer consolidated, fall back to standalone)
+    const cached = wlCacheGet(`${WL_CACHE_PREFIX}${t}_consolidated`)
+                || wlCacheGet(`${WL_CACHE_PREFIX}${t}_standalone`);
+    const agePart = cached
+      ? `<span class="wl-chip-age">${wlCacheAge(cached.cachedAt)}</span>`
+      : `<span class="wl-chip-age wl-chip-age-miss">no cache</span>`;
+    return `
+      <span class="wl-chip" title="Click ticker to load · ${cached ? 'Cached ' + wlCacheAge(cached.cachedAt) : 'Not cached'}">
+        <span class="wl-chip-name" onclick="wlLoad('${esc(t)}')">${esc(t)}</span>
+        ${agePart}
+        <button class="wl-chip-remove" onclick="wlRemove('${esc(t)}')" title="Remove from watchlist">✕</button>
+      </span>`;
+  }).join('');
 }
 
 // wlRender is called directly in loadData after success
